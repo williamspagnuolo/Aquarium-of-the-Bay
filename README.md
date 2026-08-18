@@ -2,15 +2,26 @@
 
 ## Overview
 
-This repository contains the reporting layer for the Aquarium of the Bay analytics platform.
+This repository contains the reporting and analytics layer for the Aquarium of the Bay Analytics Platform.
 
-The project transforms operational ticketing data from the Rocket Rez reservation system into analytics-ready datasets that power executive dashboards in Power BI and provide a semantic layer for future AI-powered business intelligence applications.
-
-The reporting layer sits on top of a normalized BigQuery data warehouse that is populated through an automated Google Cloud ETL pipeline.
+The platform transforms operational ticketing data from the Rocket Rez reservation system into analytics-ready datasets that power executive dashboards in Power BI through a centralized semantic reporting layer implemented with BigQuery views. The same reporting layer also provides trusted data for the Aquarium Analytics Assistant, ensuring consistency between traditional dashboards and conversational analytics.
 
 ---
 
-# Technology Stack
+## Platform Highlights
+
+- Fully automated cloud-based ELT pipeline
+- Historical data preservation with append-only archive
+- Normalized BigQuery data warehouse
+- Centralized semantic reporting layer using BigQuery views
+- Automated data quality validation
+- Power BI executive dashboards
+- Gemini-powered natural language analytics
+- Secure deployment using Cloud Run and Identity-Aware Proxy (IAP)
+
+---
+
+# Core Technologies
 
 - Google Cloud Platform (GCP)
 - BigQuery
@@ -24,190 +35,145 @@ The reporting layer sits on top of a normalized BigQuery data warehouse that is 
 
 # Architecture
 
-The analytics platform is built as an end-to-end ELT pipeline on Google Cloud Platform. Data is extracted from the Rocket Rez API, transformed into an analytics-ready data model in BigQuery, validated for quality, and exposed through reporting views that power Power BI dashboards and future AI applications.
+The analytics platform is built as an end-to-end ELT pipeline on Google Cloud Platform. Data is extracted from the Rocket Rez API, transformed into a normalized BigQuery warehouse, validated for quality, and exposed through reporting views that power both Power BI dashboards and AI-driven analytics.
 
 ```text
-Rocket Rez API
-       │
-       ▼
-Cloud Run Ingestion Job
-       │
-       ▼
-BigQuery raw_data
-       │
-       ├─────────────────────────────┐
-       │                             │
-       ▼                             ▼
-raw_data_history          BigQuery Transformation Pipeline
-(Historical Archive)               │
-                                   ▼
-                      ┌─────────────────────────┐
-                      │ orders                  │
-                      │ line_items              │
-                      │ primary_contact         │
-                      │ event                   │
-                      └─────────────────────────┘
-                                   │
-                                   ▼
-                    Data Quality Validation
-                  (Business Rules & Integrity Checks)
-                                   │
-                                   ▼
-                     Analytics Reporting Views
-                                   │
-                                   ▼
-                          Power BI Dashboards
-                                   │
-                                   ▼
-                 Business Users & AI Applications
+                     Rocket Rez API
+                            │
+                            ▼
+                  Cloud Run Ingestion Job
+                            │
+                            ▼
+                     BigQuery raw_data
+                            │
+            ┌───────────────┴───────────────┐
+            ▼                               ▼
+     raw_data_history          BigQuery Transformation Pipeline
+ (Historical Archive)                    │
+                                         ▼
+                              ┌─────────────────────────┐
+                              │ orders                  │
+                              │ line_items              │
+                              │ primary_contact         │
+                              │ event                   │
+                              └─────────────────────────┘
+                                         │
+                                         ▼
+                              Data Quality Validation
+                                         │
+                        ┌────────────────┴────────────────┐
+                        ▼                                 ▼
+              Analytics Reporting Views           AI Reporting Views
+                        │                                 │
+                        ▼                                 ▼
+               Power BI Dashboards      Aquarium Analytics Assistant
+                        │
+                        ▼
+                 Business Stakeholders
 ```
+
+---
+
+# Engineering Decisions
+
+The platform includes Architecture Decision Records (ADRs) documenting the rationale behind key design choices.
+
+| ADR | Description |
+|-----|-------------|
+| ADR-001 | Preserve historical API responses using `raw_data_history` |
+| ADR-002 | Standardize transaction reporting using Pacific Time |
+| ADR-003 | Centralize business logic in BigQuery reporting views |
+| ADR-004 | Restrict AI queries to approved reporting views |
 
 ---
 
 # Pipeline Overview
 
+The platform follows a layered architecture designed to separate ingestion, transformation, validation, and reporting.
+
 ## 1. Data Extraction
 
-A scheduled Cloud Run job retrieves transactional order data from the Rocket Rez REST API and loads the most recent snapshot into the `raw_data` table.
+A scheduled Cloud Run service retrieves transactional data from the Rocket Rez REST API and loads the most recent snapshot into the `raw_data` table.
 
-This table represents the latest operational snapshot received from Rocket Rez.
+This table represents the latest operational state of the source system.
 
 ---
 
 ## 2. Historical Archive
 
-Before transformations occur, newly received records are merged into `raw_data_history`.
+Before transformations occur, records are merged into `raw_data_history`.
 
-Unlike `raw_data`, this table preserves historical versions of orders by storing every unique combination of:
+Unlike `raw_data`, this table preserves **each version of an order** using the combination of **Order ID** and **Modified Date** as the business key.
 
-- Order ID
-- Modified Date
+This allows the platform to:
 
-This allows historical reporting based on event dates while preserving changes made to orders over time.
+- Preserve historical event information
+- Reproduce historical reports
+- Recover from pipeline failures
+- Audit changes over time
 
 ---
 
 ## 3. Data Transformation
 
-The nested Rocket Rez JSON payload is normalized into a relational schema consisting of four core tables.
+The nested Rocket Rez JSON payload is normalized into four core warehouse tables:
 
-### orders
+- **orders** – One record per transaction
+- **line_items** – Purchased tickets, memberships, products, and packages
+- **primary_contact** – Customer information
+- **event** – Scheduled visit information
 
-Contains one record per transaction.
-
-Examples:
-
-- Sales office
-- Transaction timestamps
-- Financial totals
-- Status
-- Salesperson information
-
----
-
-### line_items
-
-Contains one record for each ticket, product, membership, or package purchased.
-
-Examples:
-
-- Ticket type
-- Quantity
-- Revenue
-- Discounts
-- Taxes
-
----
-
-### primary_contact
-
-Contains customer information associated with an order.
-
-Personally identifiable information (PII) is separated into its own table to simplify governance and support secure reporting.
-
----
-
-### event
-
-Contains visit information associated with purchased tickets.
-
-Examples include:
-
-- Visit date
-- Event schedule
-- Event name
-- Start/end time
+This normalized design simplifies reporting while preserving relationships between business entities.
 
 ---
 
 # Data Validation
 
-Each transformation stage includes automated validation rules before data is considered analytics-ready.
+Every transformation stage includes automated validation before data is considered analytics-ready.
 
-Examples include:
+Validation includes:
 
 - Primary key uniqueness
 - Duplicate detection
 - Referential integrity
 - Financial reconciliation
-- Currency normalization
 - Status validation
 - Required field validation
 - Surrogate key validation
 
-Validation results are written to an audit table, and critical failures halt the pipeline to prevent inaccurate reporting.
+Validation results are written to an audit table, and critical failures halt the pipeline before reporting views are refreshed.
+
+This validation layer ensures that only trusted, internally consistent data is exposed to downstream reporting tools.
 
 ---
 
 # Reporting Layer
 
-Power BI does not connect directly to the transactional tables.
+Power BI does not query transactional warehouse tables directly.
 
-Instead, dashboards consume curated BigQuery views that:
+Instead, dashboards consume curated BigQuery reporting views that:
 
-- encapsulate business logic
-- simplify report development
-- improve performance
-- provide consistent KPI definitions
-- isolate Power BI from schema changes
+- Centralize business logic
+- Simplify report development
+- Improve query performance
+- Provide consistent KPI definitions
+- Isolate reports from warehouse schema changes
 
-Each reporting view is stored twice in this repository:
+Each reporting object in this repository is stored in two forms.
 
-## View Definition
+### View Definition
 
-Example:
+Contains the complete `CREATE OR REPLACE VIEW` statement used in production.
 
-```
-vw_membership_tabular.sql
-```
+### Query Only
 
-Contains the complete
-
-```sql
-CREATE OR REPLACE VIEW ...
-```
-
-statement used to deploy the view.
-
----
-
-## Query Only
-
-Example:
-
-```
-Membership_Tabular.sql
-```
-
-Contains only the SELECT statement.
-
-This makes the business logic easier to review, modify, and test without recreating the view.
+Contains only the `SELECT` statement, making the business logic easier to read, review, and test.
 
 ---
 
 # Available Reporting Views
 
-Current reporting views include:
+The reporting layer currently includes views for:
 
 ## Revenue
 
@@ -217,8 +183,6 @@ Current reporting views include:
 - Median Daily Revenue
 - Total Revenue per Visitor
 
----
-
 ## Transactions
 
 - Average Daily Transactions
@@ -227,8 +191,6 @@ Current reporting views include:
 - Median Transaction Value
 - Refund / Void Rate
 
----
-
 ## Attendance
 
 - Monthly Headcount by Ticket Type
@@ -236,8 +198,6 @@ Current reporting views include:
 - Yesterday's Tickets Sold
 - Seven Day Headcount
 - Thirty Day Headcount
-
----
 
 ## Memberships
 
@@ -248,92 +208,111 @@ Current reporting views include:
 
 # Power BI
 
-Power BI connects directly to the reporting views in BigQuery.
+Power BI connects directly to approved reporting views in BigQuery rather than normalized warehouse tables.
 
-Advantages include:
+This architecture provides:
 
-- Minimal transformation inside Power BI
-- Consistent business definitions
-- Faster report development
+- Minimal transformation within Power BI
 - Centralized SQL maintenance
-- Improved report performance
+- Consistent KPI definitions
+- Faster report development
+- Improved maintainability
 
-Because the business logic resides inside BigQuery, updating a reporting rule requires changing only the SQL view rather than every individual Power BI visual.
+Business logic is implemented once within BigQuery, allowing every dashboard to consume the same trusted metrics.
 
 ---
 
 # Date Handling
 
-One important design decision in this project is the consistent use of the Aquarium's local timezone.
+One of the key architectural decisions within the platform is the consistent use of the Aquarium's local timezone.
 
-Revenue calculations use:
+Revenue and transaction reporting use:
 
-```
-America/Los_Angeles
+```sql
+DATE(created_date, "America/Los_Angeles")
 ```
 
 instead of UTC.
 
-This prevents transactions occurring shortly after midnight UTC from appearing in the incorrect business day or reporting month.
+Attendance reporting uses scheduled event dates rather than purchase dates.
 
-Most yearly reporting views intentionally use fixed date ranges such as:
+Most annual reporting views intentionally use fixed yearly reporting windows (for example, January 1 through December 31). These windows are updated once each year after financial reporting has closed, preserving historical dashboard consistency.
 
-```sql
-DATE(created_date, "America/Los_Angeles") >= DATE '2026-01-01'
-
-DATE(created_date, "America/Los_Angeles") < DATE '2027-01-01'
-```
-
-These dates are updated once each year after the books close to preserve historical reporting snapshots.
-
-Operational rolling-window reports (Yesterday, Last 7 Days, Last 30 Days) remain fully dynamic.
+Rolling operational reports (Yesterday, Last 7 Days, Last 30 Days) remain fully dynamic.
 
 ---
 
 # Repository Structure
 
+```text
+.
+├── ai_assistant/
+│   ├── README.md
+│   ├── DEPLOYMENT.md
+│   ├── app.py
+│   ├── schema_context.py
+│   ├── sql_validator.py
+│   └── ...
+│
+├── ingestion/
+│   ├── main.py
+│   ├── main_backfill.ipynb
+│   └── ...
+│
+├── orchestration/
+│   └── workflow.yaml
+│
+├── sql/
+│   ├── transformations/
+│   ├── validation/
+│   ├── reporting_views/
+│   └── ai_views/
+│
+├── powerbi/
+│
+├── docs/
+│   ├── PIPELINE_ARCHITECTURE.md
+│   ├── DATA_MODEL.md
+│   ├── DATA_QUALITY.md
+│   ├── POWERBI_REPORTING.md
+│   ├── OPERATIONS.md
+│   ├── PROJECT_HISTORY.md
+│   └── decisions/
+│       ├── ADR-001-raw-data-history.md
+│       ├── ADR-002-pacific-time-reporting.md
+│       ├── ADR-003-reporting-views.md
+│       └── ADR-004-ai-reporting-layer.md
+│
+└── README.md
 ```
-Views/
-│
-├── Revenue/
-├── Transactions/
-├── Attendance/
-├── Membership/
-│
-├── vw_revenue_by_sales_channel.sql
-├── Revenue_By_Sales_Channel.sql
-│
-├── vw_monthly_revenue_by_ticket_type.sql
-├── Monthly_Revenue_By_Ticket_Type.sql
-│
-└── ...
-```
-
-Each reporting object contains:
-
-- View creation script
-- Standalone query version
 
 ---
 
-# Future Enhancements
+# Repository Documentation
 
-Planned improvements include:
+The repository includes comprehensive engineering documentation covering every major component of the platform.
 
-- Streamlit AI analytics assistant
-- Natural language querying using Vertex AI
-- BigQuery semantic layer for AI
-- Automated yearly view generation
-- Additional operational dashboards
-- Row-level security for sensitive reporting
-- Cloud Run deployment for AI assistant
+| Document | Description |
+|----------|-------------|
+| `PIPELINE_ARCHITECTURE.md` | End-to-end cloud architecture and data flow |
+| `DATA_MODEL.md` | Warehouse schema and normalization strategy |
+| `DATA_QUALITY.md` | Validation framework and quality controls |
+| `POWERBI_REPORTING.md` | Reporting architecture and semantic reporting layer |
+| `OPERATIONS.md` | Operational procedures, deployment, and maintenance |
+| `PROJECT_HISTORY.md` | Evolution of the platform over time |
+| `docs/decisions/` | Architecture Decision Records (ADRs) |
+| `ai_assistant/README.md` | Aquarium Analytics Assistant architecture |
+| `ai_assistant/DEPLOYMENT.md` | AI deployment procedures |
 
 ---
 
-# Author
+# Repository Creator
 
-William Spagnuolo
+**William Spagnuolo**
 
-MS Data Science — University of San Francisco
+Data Science Intern  
+Aquarium of the Bay
+October 2025 - August 2026
 
-Data Engineering | Cloud Analytics | BigQuery | Power BI | Google Cloud Platform
+M.S. Data Science  
+University of San Francisco
