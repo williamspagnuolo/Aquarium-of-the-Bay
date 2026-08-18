@@ -1,0 +1,1842 @@
+main:
+  steps:
+    # ------------------------------------------------------------
+    # 0) CONFIG
+    # ------------------------------------------------------------
+    - init:
+        assign:
+          - project_id: rocket-rez-api
+          - region: us-central1
+          - ingestion_job: rocket-rez-ingestion
+          - gx_job: rocket-rez-gx-validation
+
+    # ------------------------------------------------------------
+    # 1) RUN INGESTION (Cloud Run Job)
+    # ------------------------------------------------------------
+    - run_ingestion:
+        call: googleapis.run.v2.projects.locations.jobs.run
+        args:
+          name: ${"projects/" + project_id + "/locations/" + region + "/jobs/" + ingestion_job}
+        result: ingestion_result
+    
+    # ------------------------------------------------------------
+    # Merge into raw_data_history table
+    # ------------------------------------------------------------
+    
+    - merge_raw_data_history:
+        call: googleapis.bigquery.v2.jobs.insert
+        args:
+            projectId: ${project_id}
+            body:
+                configuration:
+                    query:
+                        query: |
+                            MERGE `rocket_rez_data.raw_data_history` AS tgt
+                            USING (
+                            SELECT
+                                r.*,
+                                CURRENT_TIMESTAMP() AS ingestion_timestamp,
+                                CURRENT_DATE('America/Los_Angeles') AS ingestion_date
+                            FROM `rocket_rez_data.raw_data` r
+                            ) AS src
+                            ON tgt.id = src.id
+                            AND tgt.modifiedDate = src.modifiedDate
+
+                            WHEN NOT MATCHED THEN
+                            INSERT (
+                            primaryContact,
+                            subTotal,
+                            variableFeeTotal,
+                            orderUrl,
+                            id,
+                            total,
+                            salesPersonId,
+                            taxTotal,
+                            currencyName,
+                            lineItems,
+                            discountTotal,
+                            conceirgeId,
+                            contactGroupName,
+                            gratuityTotal,
+                            status,
+                            isWebOrder,
+                            contactGroupId,
+                            salesOfficeId,
+                            salesPersonLastName,
+                            modifiedDate,
+                            salesOfficeName,
+                            salesPersonFirstName,
+                            createdDate,
+                            questions,
+                            ingestion_timestamp,
+                            ingestion_date
+                            )
+                            VALUES (
+                            src.primaryContact,
+                            src.subTotal,
+                            src.variableFeeTotal,
+                            src.orderUrl,
+                            src.id,
+                            src.total,
+                            src.salesPersonId,
+                            src.taxTotal,
+                            src.currencyName,
+                            src.lineItems,
+                            src.discountTotal,
+                            src.conceirgeId,
+                            src.contactGroupName,
+                            src.gratuityTotal,
+                            src.status,
+                            src.isWebOrder,
+                            src.contactGroupId,
+                            src.salesOfficeId,
+                            src.salesPersonLastName,
+                            src.modifiedDate,
+                            src.salesOfficeName,
+                            src.salesPersonFirstName,
+                            src.createdDate,
+                            src.questions,
+                            src.ingestion_timestamp,
+                            src.ingestion_date
+                            );
+                        useLegacySql: false
+
+    # ------------------------------------------------------------
+    # 2) TRANSFORM: ORDERS
+    # ------------------------------------------------------------
+    - transform_orders:
+        call: googleapis.bigquery.v2.jobs.insert
+        args:
+          projectId: ${project_id}
+          body:
+            configuration:
+              query:
+                query: |
+                  -- ORDERS TABLE SEPARATION SQL
+                  -- 1) TEMP UDF: normalize currencyName to strict 3-letter ISO or NULL
+                    CREATE TEMP FUNCTION normalize_currency(s STRING) AS (
+                    (
+                        WITH raw AS (
+                        SELECT s AS val
+                        ),
+                        step1 AS (
+                        -- Replace any Unicode space separators with a regular space, then TRIM and UPPER
+                        SELECT UPPER(TRIM(REGEXP_REPLACE(val, r'\p{Zs}+', ' '))) AS v
+                        FROM raw
+                        ),
+                        step2 AS (
+                        -- Map common non-ISO forms to ISO
+                        SELECT
+                            CASE
+                            WHEN v IS NULL OR v = '' THEN NULL
+                            WHEN REGEXP_CONTAINS(v, r'^\$|^US\$|^USD\$|^U\.S\.D\.$') THEN 'USD'
+                            ELSE v
+                            END AS v2
+                        FROM step1
+                        ),
+                        step3 AS (
+                        -- If not already a clean 3-letter code, try to extract the first 3-letter token
+                        SELECT
+                            CASE
+                            WHEN REGEXP_CONTAINS(v2, r'^[A-Z]{3}$') THEN v2
+                            ELSE REGEXP_EXTRACT(v2, r'([A-Z]{3})')
+                            END AS v3
+                        FROM step2
+                        )
+                        SELECT v3 FROM step3
+                    )
+                    );
+
+                    -- 2) Idempotent MERGE: orders
+                    MERGE `rocket_rez_data.orders` AS tgt
+                    USING (
+                    SELECT
+                        r.id                                  AS order_id,
+                        r.conceirgeId                         AS conceirge_id,
+                        r.createdDate                         AS created_date,
+                        r.modifiedDate                        AS modified_date,
+                        r.status                              AS status,
+                        r.salesOfficeId                       AS salesoffice_id,
+                        r.salesOfficeName                     AS salesoffice_name,
+                        r.salesPersonFirstName                AS sales_person_firstname,
+                        r.salesPersonLastName                 AS sales_person_lastname,
+                        r.salesPersonId                       AS sales_person_id,
+                        r.isWebOrder                          AS web_order,
+                        CAST(r.total         AS NUMERIC)      AS total,
+                        CAST(r.taxTotal      AS NUMERIC)      AS tax_total,
+                        CAST(r.subTotal      AS NUMERIC)      AS subtotal,
+                        CAST(r.discountTotal AS NUMERIC)      AS discount_total,
+                        CAST(r.gratuityTotal AS NUMERIC)      AS gratuity_total,
+
+                        -- Normalize your only source field: currencyName
+                        normalize_currency(r.currencyName)    AS currency,
+
+                        TO_JSON_STRING(r.questions)           AS question,
+                        r.contactGroupId                      AS contact_group_id,
+                        r.contactGroupName                    AS contact_group_name
+                    FROM `rocket_rez_data.raw_data` r
+                    ) AS src
+                    ON tgt.order_id = src.order_id
+
+                    WHEN NOT MATCHED THEN
+                    INSERT (
+                        order_id, conceirge_id, created_date, modified_date, status,
+                        salesoffice_id, salesoffice_name, sales_person_firstname, sales_person_lastname,
+                        sales_person_id, web_order, total, tax_total, subtotal, discount_total,
+                        gratuity_total, currency, question, contact_group_id, contact_group_name
+                    )
+                    VALUES (
+                        src.order_id, src.conceirge_id, src.created_date, src.modified_date, src.status,
+                        src.salesoffice_id, src.salesoffice_name, src.sales_person_firstname, src.sales_person_lastname,
+                        src.sales_person_id, src.web_order, src.total, src.tax_total, src.subtotal, src.discount_total,
+                        src.gratuity_total, src.currency, src.question, src.contact_group_id, src.contact_group_name
+                    )
+
+                    -- Optional upsert of changed fields (NULL-safe comparisons).
+                    WHEN MATCHED AND (
+                    tgt.currency        IS DISTINCT FROM src.currency        OR
+                    tgt.total           IS DISTINCT FROM src.total           OR
+                    tgt.tax_total       IS DISTINCT FROM src.tax_total       OR
+                    tgt.subtotal        IS DISTINCT FROM src.subtotal        OR
+                    tgt.discount_total  IS DISTINCT FROM src.discount_total  OR
+                    tgt.gratuity_total  IS DISTINCT FROM src.gratuity_total  OR
+                    tgt.status          IS DISTINCT FROM src.status
+                    )
+                    THEN UPDATE SET
+                    tgt.currency        = src.currency,
+                    tgt.total           = src.total,
+                    tgt.tax_total       = src.tax_total,
+                    tgt.subtotal        = src.subtotal,
+                    tgt.discount_total  = src.discount_total,
+                    tgt.gratuity_total  = src.gratuity_total,
+                    tgt.status          = src.status;
+
+                    -- 3) Inline ASSERT: fail the job if any non-ISO currency slips in
+                    ASSERT (
+                    SELECT COUNT(*)
+                    FROM `rocket_rez_data.orders`
+                    WHERE currency IS NOT NULL
+                        AND NOT REGEXP_CONTAINS(currency, r'^[A-Z]{3}$')
+                    ) = 0 AS 'Bad currency format detected in json_test.orders.';
+                useLegacySql: false
+
+    # ------------------------------------------------------------
+    # 3) TRANSFORM: LINE_ITEMS
+    # ------------------------------------------------------------
+    - transform_line_items:
+        call: googleapis.bigquery.v2.jobs.insert
+        args:
+          projectId: ${project_id}
+          body:
+            configuration:
+              query:
+                query: |
+                  -- LINE_ITEMS TABLE SEPARATION SQL
+                  MERGE `rocket_rez_data.line_items` AS tgt
+                    USING (
+                    SELECT
+                        -- Warehouse surrogate key generated per incoming row (used only when inserting)
+                        GENERATE_UUID()                                  AS surrogate_key,
+
+                        -- Business key columns
+                        r.id                                             AS order_id,
+                        li.id                                            AS line_item_id,
+                        ra.rateType                                      AS rate_type,
+
+                        -- Attributes (normalized / typed)
+                        li.type                                          AS line_item_type,
+                        li.typeId                                        AS line_item_type_id,
+                        li.name                                          AS line_item_name,
+                        CAST(li.productId AS STRING)                     AS product_id,
+                        CAST(ra.price AS NUMERIC)                        AS line_item_price,
+                        CAST(ra.taxTotal AS NUMERIC)                     AS line_item_tax_total,
+                        CAST(ra.subTotal AS NUMERIC)                     AS line_item_subtotal,
+                        ARRAY_TO_STRING(ra.serials, ',')                 AS serials,
+                        ra.quantity                                      AS line_item_quantity,
+                        CAST(ra.couponAmount AS NUMERIC)                 AS coupon_amount,
+                        CAST(ra.priceOverrideAmount AS NUMERIC)          AS price_override_amount
+                    FROM `rocket_rez_data.raw_data` AS r
+                    LEFT JOIN UNNEST(IFNULL(r.lineItems, [])) AS li ON TRUE
+                    LEFT JOIN UNNEST(IFNULL(li.rateTypes, [])) AS ra ON TRUE
+                    WHERE li.id IS NOT NULL
+                        AND ra.rateType IS NOT NULL
+                    ) AS src
+                    ON  tgt.order_id      = src.order_id
+                    AND tgt.line_item_id  = src.line_item_id
+                    AND tgt.rate_type     = src.rate_type
+
+                    WHEN NOT MATCHED THEN
+                    INSERT (
+                        surrogate_key,
+                        line_item_id,
+                        line_item_type,
+                        line_item_type_id,
+                        line_item_name,
+                        product_id,
+                        line_item_price,
+                        line_item_tax_total,
+                        line_item_subtotal,
+                        serials,
+                        line_item_quantity,
+                        rate_type,
+                        coupon_amount,
+                        price_override_amount,
+                        order_id
+                    )
+                    VALUES (
+                        src.surrogate_key,
+                        src.line_item_id,
+                        src.line_item_type,
+                        src.line_item_type_id,
+                        src.line_item_name,
+                        src.product_id,
+                        src.line_item_price,
+                        src.line_item_tax_total,
+                        src.line_item_subtotal,
+                        src.serials,
+                        src.line_item_quantity,
+                        src.rate_type,
+                        src.coupon_amount,
+                        src.price_override_amount,
+                        src.order_id
+                    );
+
+
+                    ASSERT (
+                    SELECT COUNT(*) FROM (
+                        SELECT order_id, line_item_id, rate_type
+                        FROM `rocket_rez_data.line_items`
+                        GROUP BY order_id, line_item_id, rate_type
+                        HAVING COUNT(*) > 1
+                    )
+                    ) = 0 AS 'Duplicate line_items at (order_id, line_item_id, rate_type) detected.';
+                useLegacySql: false
+
+    # ------------------------------------------------------------
+    # 4) TRANSFORM: PRIMARY_CONTACT
+    # ------------------------------------------------------------
+    - transform_primary_contact:
+        call: googleapis.bigquery.v2.jobs.insert
+        args:
+          projectId: ${project_id}
+          body:
+            configuration:
+              query:
+                query: |
+                  -- PRIMARY_CONTACT TABLE SEPARATION SQL
+                  MERGE `rocket_rez_data.primary_contact` AS tgt
+                    USING (
+                    SELECT
+                        -- Surrogate key generated per incoming row (used only when inserting)
+                        GENERATE_UUID() AS contact_surrogate_key,
+
+                        -- Source metadata (not a unique key)
+                        r.primaryContact.id                                   AS primary_contact_id,
+
+                        -- Normalized identity fields
+                        TRIM(r.primaryContact.firstName)                      AS first_name,
+                        TRIM(r.primaryContact.lastName)                       AS last_name,
+                        NULLIF(LOWER(TRIM(r.primaryContact.email)), 'no email') AS email,
+                        NULLIF(REGEXP_REPLACE(LOWER(TRIM(r.primaryContact.phone)), r'[^0-9x]', ''), '') AS phone,
+
+                        -- Address (trimmed)
+                        TRIM(r.primaryContact.billingAddress.addressLine1)    AS address_line1,
+                        TRIM(r.primaryContact.billingAddress.addressLine2)    AS address_line2,
+                        TRIM(r.primaryContact.billingAddress.city)            AS city,
+                        TRIM(r.primaryContact.billingAddress.province)        AS province,
+                        TRIM(r.primaryContact.billingAddress.postalCode)      AS postal_code,
+                        TRIM(r.primaryContact.billingAddress.country)         AS country,
+
+                        -- Business grain: one contact snapshot per order
+                        r.id                                                  AS order_id,
+
+                        -- Walk-up/unknown contact flag (derived)
+                        CASE
+                        WHEN (r.primaryContact.email IS NULL 
+                                OR LOWER(TRIM(r.primaryContact.email)) = 'no email' 
+                                OR TRIM(r.primaryContact.email) = '')
+                        AND (r.primaryContact.firstName IS NULL OR TRIM(r.primaryContact.firstName) = '')
+                        AND (r.primaryContact.lastName  IS NULL OR TRIM(r.primaryContact.lastName)  = '')
+                        AND (r.primaryContact.phone IS NULL
+                                OR REGEXP_REPLACE(LOWER(TRIM(r.primaryContact.phone)), r'[^0-9x]', '') = '')
+                        THEN TRUE
+                        ELSE FALSE
+                        END AS is_unknown_contact
+                    FROM `rocket_rez_data.raw_data` AS r
+                    ) AS src
+                    ON tgt.order_id = src.order_id   -- natural business grain
+
+                    WHEN NOT MATCHED THEN
+                    INSERT (
+                        contact_surrogate_key,
+                        primary_contact_id,
+                        first_name,
+                        last_name,
+                        email,
+                        phone,
+                        address_line1,
+                        address_line2,
+                        city,
+                        province,
+                        postal_code,
+                        country,
+                        order_id,
+                        is_unknown_contact
+                    )
+                    VALUES (
+                        src.contact_surrogate_key,
+                        src.primary_contact_id,
+                        src.first_name,
+                        src.last_name,
+                        src.email,
+                        src.phone,
+                        src.address_line1,
+                        src.address_line2,
+                        src.city,
+                        src.province,
+                        src.postal_code,
+                        src.country,
+                        src.order_id,
+                        src.is_unknown_contact
+                    )
+
+                    -- Optional: keep the latest known contact details if a returning order reappears
+                    -- (Only include this WHEN MATCHED block if you want to refresh contact info)
+                    WHEN MATCHED AND (
+                        tgt.first_name        IS DISTINCT FROM src.first_name OR
+                        tgt.last_name         IS DISTINCT FROM src.last_name  OR
+                        tgt.email             IS DISTINCT FROM src.email      OR
+                        tgt.phone             IS DISTINCT FROM src.phone      OR
+                        tgt.address_line1     IS DISTINCT FROM src.address_line1 OR
+                        tgt.address_line2     IS DISTINCT FROM src.address_line2 OR
+                        tgt.city              IS DISTINCT FROM src.city       OR
+                        tgt.province          IS DISTINCT FROM src.province   OR
+                        tgt.postal_code       IS DISTINCT FROM src.postal_code OR
+                        tgt.country           IS DISTINCT FROM src.country    OR
+                        tgt.primary_contact_id IS DISTINCT FROM src.primary_contact_id OR
+                        tgt.is_unknown_contact IS DISTINCT FROM src.is_unknown_contact
+                    )
+                    THEN UPDATE SET
+                    tgt.primary_contact_id  = src.primary_contact_id,
+                    tgt.first_name          = src.first_name,
+                    tgt.last_name           = src.last_name,
+                    tgt.email               = src.email,
+                    tgt.phone               = src.phone,
+                    tgt.address_line1       = src.address_line1,
+                    tgt.address_line2       = src.address_line2,
+                    tgt.city                = src.city,
+                    tgt.province            = src.province,
+                    tgt.postal_code         = src.postal_code,
+                    tgt.country             = src.country,
+                    tgt.is_unknown_contact  = src.is_unknown_contact;
+
+                    ASSERT (
+                    SELECT COUNT(*) FROM (
+                        SELECT order_id
+                        FROM `rocket_rez_data.primary_contact`
+                        GROUP BY order_id
+                        HAVING COUNT(*) > 1
+                    )
+                    ) = 0 AS 'Duplicate primary_contact rows per order_id detected.';
+                useLegacySql: false
+
+    # ------------------------------------------------------------
+    # 5) TRANSFORM: EVENT
+    # ------------------------------------------------------------
+    - transform_event:
+        call: googleapis.bigquery.v2.jobs.insert
+        args:
+          projectId: ${project_id}
+          body:
+            configuration:
+              query:
+                query: |
+                  -- EVENT TABLE SEPARATION SQL
+                  MERGE `rocket_rez_data.event` AS tgt
+                    USING (
+                    -- 1) Flatten raw JSON; exclude rows where ALL schedule fields are NULL
+                    WITH flattened AS (
+                        SELECT
+                        li.event.id                                    AS event_id,
+                        li.event.schedule.id                           AS schedule_id,
+                        li.event.type                                  AS event_type,
+                        li.event.name                                  AS event_name,
+                        CAST(li.event.schedule.date      AS DATE)      AS event_date,
+                        CAST(li.event.schedule.startTime AS TIMESTAMP) AS event_start,
+                        CAST(li.event.schedule.endTime   AS TIMESTAMP) AS event_end,
+                        r.id                                           AS order_id
+                        FROM `rocket_rez_data.raw_data` AS r
+                        LEFT JOIN UNNEST(IFNULL(r.lineItems, [])) AS li
+                        WHERE NOT (
+                        li.event.schedule.id        IS NULL AND
+                        li.event.schedule.date      IS NULL AND
+                        li.event.schedule.startTime IS NULL AND
+                        li.event.schedule.endTime   IS NULL
+                        )
+                    ),
+
+                    -- 2) Build schedule-composite key (sched_key)
+                    with_sched_key AS (
+                        SELECT
+                        *,
+                        CONCAT(
+                            'SCHED:', IFNULL(CAST(schedule_id AS STRING),'MISSING'), '|',
+                            IFNULL(CAST(event_date  AS STRING),'MISSING'), '|',
+                            IFNULL(CAST(event_start AS STRING),'MISSING'), '|'
+                        ) AS sched_key
+                        FROM flattened
+                    ),
+
+                    -- 3) Schedules where multiple distinct event_ids appear
+                    conflicting_sched AS (
+                        SELECT
+                        sched_key,
+                        COUNT(DISTINCT event_id) AS distinct_event_ids
+                        FROM with_sched_key
+                        GROUP BY sched_key
+                        HAVING COUNT(DISTINCT event_id) > 1
+                    ),
+
+                    -- 4) event_ids that are reused across >1 schedule (never use event_id to dedup those)
+                    reused_event_ids AS (
+                        SELECT event_id
+                        FROM with_sched_key
+                        WHERE event_id IS NOT NULL
+                        GROUP BY event_id
+                        HAVING COUNT(DISTINCT sched_key) > 1
+                    ),
+
+                    -- 5) Choose dedup key: use sched_key when conflicting OR reused id; else prefer event_id
+                    keyed AS (
+                        SELECT
+                        w.*,
+                        CASE
+                            WHEN c.sched_key IS NOT NULL
+                            OR re.event_id IS NOT NULL
+                            THEN w.sched_key
+                            ELSE COALESCE(CAST(w.event_id AS STRING), w.sched_key)
+                        END AS dedup_key
+                        FROM with_sched_key AS w
+                        LEFT JOIN conflicting_sched AS c ON w.sched_key = c.sched_key
+                        LEFT JOIN reused_event_ids  AS re ON w.event_id  = re.event_id
+                    ),
+
+                    -- 6) Rank event_id candidates per dedup group (most frequent wins; ties → smallest id)
+                    id_rank AS (
+                        SELECT
+                        dedup_key,
+                        event_id,
+                        COUNT(*) AS cnt,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY dedup_key
+                            ORDER BY COUNT(*) DESC, event_id
+                        ) AS rn
+                        FROM keyed
+                        GROUP BY dedup_key, event_id
+                    ),
+
+                    -- 7) Pick canonical event_id
+                    chosen_id AS (
+                        SELECT dedup_key, event_id AS canonical_event_id
+                        FROM id_rank
+                        WHERE rn = 1
+                    ),
+
+                    -- 8) Collapse to one row per dedup_key (one real event)
+                    collapsed AS (
+                        SELECT
+                        k.dedup_key,
+                        ANY_VALUE(k.event_type)   AS event_type,
+                        ANY_VALUE(k.event_name)   AS event_name,
+                        ANY_VALUE(k.event_date)   AS event_date,
+                        ANY_VALUE(k.event_start)  AS event_start,
+                        MAX(k.event_end)          AS event_end,
+                        ANY_VALUE(k.schedule_id)  AS schedule_id,
+                        ANY_VALUE(k.order_id)     AS order_id
+                        FROM keyed AS k
+                        GROUP BY k.dedup_key
+                    ),
+
+                    -- 9) Final rows to upsert
+                    final_rows AS (
+                        SELECT
+                        GENERATE_UUID()            AS event_surrogate_key,
+                        c.canonical_event_id       AS event_id,
+                        x.event_type,
+                        x.event_name,
+                        x.event_date,
+                        x.event_start,
+                        x.event_end,
+                        x.schedule_id,
+                        x.order_id
+                        FROM collapsed AS x
+                        LEFT JOIN chosen_id AS c
+                        ON x.dedup_key = c.dedup_key
+                    )
+
+                    SELECT * FROM final_rows
+                    ) AS src
+                    -- Natural identity (grain) for events:
+                    ON  tgt.schedule_id IS NOT DISTINCT FROM src.schedule_id
+                    AND tgt.event_date  IS NOT DISTINCT FROM src.event_date
+                    AND tgt.event_start IS NOT DISTINCT FROM src.event_start
+
+                    -- Insert missing events
+                    WHEN NOT MATCHED THEN
+                    INSERT (
+                        event_surrogate_key,
+                        event_id,
+                        event_type,
+                        event_name,
+                        event_date,
+                        event_start,
+                        event_end,
+                        schedule_id,
+                        order_id
+                    )
+                    VALUES (
+                        src.event_surrogate_key,
+                        src.event_id,
+                        src.event_type,
+                        src.event_name,
+                        src.event_date,
+                        src.event_start,
+                        src.event_end,
+                        src.schedule_id,
+                        src.order_id
+                    )
+
+                    -- Update when canonical attributes change (including event_end)
+                    WHEN MATCHED AND (
+                        tgt.event_id   IS DISTINCT FROM src.event_id   OR
+                        tgt.event_type IS DISTINCT FROM src.event_type OR
+                        tgt.event_name IS DISTINCT FROM src.event_name OR
+                        tgt.order_id   IS DISTINCT FROM src.order_id   OR
+                        tgt.event_end  IS DISTINCT FROM src.event_end
+                    )
+                    THEN UPDATE SET
+                    tgt.event_id   = src.event_id,
+                    tgt.event_type = src.event_type,
+                    tgt.event_name = src.event_name,
+                    tgt.order_id   = src.order_id,
+                    tgt.event_end  = src.event_end;
+
+
+                    ASSERT (
+                    SELECT COUNT(*)
+                    FROM (
+                        SELECT schedule_id, event_date, event_start
+                        FROM `rocket_rez_data.event`
+                        GROUP BY 1,2,3
+                        HAVING COUNT(*) > 1
+                    )
+                    ) = 0 AS 'Duplicate events at (schedule_id, event_date, event_start) detected.';
+
+                useLegacySql: false
+
+    # ------------------------------------------------------------
+    # 6) VALIDATE: ORDERS
+    # ------------------------------------------------------------
+    - validate_orders:
+        call: googleapis.bigquery.v2.jobs.insert
+        args:
+            projectId: ${project_id}
+            body:
+                configuration:
+                    query:
+                        query: |
+                            CREATE TEMP TABLE validation_results AS(
+
+                            WITH
+                            /* ---------------------------------------------------------------
+                            0) TABLE references
+                            ---------------------------------------------------------------- */
+                            orders AS (
+                            SELECT
+                                order_id,
+                                conceirge_id,
+                                created_date,
+                                modified_date,
+                                status,
+                                salesoffice_id,
+                                salesoffice_name,
+                                sales_person_firstname,
+                                sales_person_lastname,
+                                sales_person_id,
+                                web_order,
+                                total,
+                                tax_total,
+                                subtotal,
+                                discount_total,
+                                gratuity_total,
+                                currency,
+                                question,
+                                contact_group_id,
+                                contact_group_name
+                            FROM `rocket_rez_data.orders`
+                            ),
+                            orders_raw AS (
+                            SELECT DISTINCT r.id AS order_id
+                            FROM `rocket_rez_data.raw_data` r
+                            ),
+                            line_items AS (
+                            SELECT DISTINCT order_id
+                            FROM `rocket_rez_data.line_items`
+                            ),
+                            primary_contact AS (
+                            SELECT DISTINCT order_id
+                            FROM `rocket_rez_data.primary_contact`
+                            ),
+
+                            /* ---------------------------------------------------------------
+                            1) NOT NULL / REQUIRED overview
+                            ---------------------------------------------------------------- */
+                            null_overview AS (
+                            SELECT
+                                COUNT(*) AS total_rows,
+                                COUNTIF(order_id IS NULL)         AS null_order_id,
+                                COUNTIF(created_date IS NULL)     AS null_created_date,
+                                COUNTIF(modified_date IS NULL)    AS null_modified_date,
+                                COUNTIF(total IS NULL)            AS null_total,
+                                COUNTIF(subtotal IS NULL)         AS null_subtotal,
+                                COUNTIF(tax_total IS NULL)        AS null_tax_total,
+                                COUNTIF(discount_total IS NULL)   AS null_discount_total,
+                                COUNTIF(gratuity_total IS NULL)   AS null_gratuity_total,
+                                COUNTIF(currency IS NULL OR TRIM(currency) = '') AS null_or_empty_currency
+                            FROM orders
+                            ),
+
+                            /* ---------------------------------------------------------------
+                            2) PRIMARY KEY uniqueness on order_id
+                            ---------------------------------------------------------------- */
+                            dup_order_id AS (
+                            SELECT order_id, COUNT(*) AS cnt
+                            FROM orders
+                            GROUP BY order_id
+                            HAVING COUNT(*) > 1
+                            ),
+
+                            /* ---------------------------------------------------------------
+                            3) Timestamp sanity: created ≤ modified
+                            ---------------------------------------------------------------- */
+                            bad_timestamp_order AS (
+                            SELECT order_id, created_date, modified_date
+                            FROM orders
+                            WHERE created_date IS NOT NULL
+                                AND modified_date IS NOT NULL
+                                AND modified_date < created_date
+                            ),
+
+                            /* ---------------------------------------------------------------
+                            4) Currency format: strict ISO-4217 (3 letters)
+                            ---------------------------------------------------------------- */
+                            bad_currency_format AS (
+                            SELECT order_id, currency
+                            FROM orders
+                            WHERE currency IS NOT NULL
+                                AND NOT REGEXP_CONTAINS(currency, r'^[A-Z]{3}$')
+                            ),
+
+                            /* ---------------------------------------------------------------
+                            5) Status sanity — Option A allow-list (source vocabulary kept)
+                            ---------------------------------------------------------------- */
+                            bad_status AS (
+                            SELECT order_id, status
+                            FROM orders
+                            WHERE status IS NOT NULL
+                                AND UPPER(TRIM(REGEXP_REPLACE(status, r'\p{Zs}+', ' ')))
+                                    NOT IN (
+                                    'OPEN','PENDING','PAID','COMPLETED','CANCELLED','REFUNDED',
+                                    'ACTIVE','ESTIMATE','VOID', 'WAIT/HOLD'
+                                    )
+                            ),
+
+                            /* ---------------------------------------------------------------
+                            6) FINANCIAL MISMATCH — RocketRez multi-model logic (FINAL)
+                                Order fails ONLY if it fails ALL allowed explicit-tax models
+                            ---------------------------------------------------------------- */
+                            /* ---------------------------------------------------------------
+                            6) FINANCIAL MISMATCH — RocketRez multi-model logic (FINAL + FEES)
+                                Order fails ONLY if it fails ALL allowed explicit-tax models
+                                INCLUDING fee-based residuals (Model F)
+                            ---------------------------------------------------------------- */
+                            financial_mismatch AS (
+                            SELECT
+                                order_id,
+                                status,
+                                subtotal,
+                                discount_total,
+                                tax_total,
+                                gratuity_total,
+                                total,
+
+                                -- Residual amount (potential fees)
+                                ROUND(
+                                total - (subtotal + tax_total + gratuity_total),
+                                2
+                                ) AS fee_residual,
+
+                                -- Model A: discount reduces taxable base
+                                ABS(
+                                ROUND(total,2) -
+                                ROUND(subtotal - discount_total + tax_total + gratuity_total, 2)
+                                ) AS delta_model_a,
+
+                                -- Model B: tax applied pre-discount
+                                ABS(
+                                ROUND(total,2) -
+                                ROUND(subtotal + tax_total + gratuity_total, 2)
+                                ) AS delta_model_b,
+
+                                -- Model D: discount as post-tax payment / credit
+                                ABS(
+                                ROUND(total,2) -
+                                ROUND(subtotal + tax_total + discount_total + gratuity_total, 2)
+                                ) AS delta_model_d,
+
+                                -- Model E: partially-taxable discount (legacy mixed-tax)
+                                ABS(
+                                ROUND(total,2) -
+                                ROUND(
+                                    subtotal
+                                    + tax_total
+                                    + discount_total
+                                    - (discount_total * SAFE_DIVIDE(tax_total, NULLIF(subtotal,0))),
+                                    2
+                                )
+                                ) AS delta_model_e
+
+                            FROM orders
+
+                            WHERE
+                                -- Only validate financially meaningful orders
+                                UPPER(status) NOT IN ('CANCELLED','VOID','REFUNDED')
+                                AND COALESCE(tax_total,0) > 0
+
+                                -- Fail ONLY if all known models fail
+                                AND ABS(ROUND(total,2) - ROUND(subtotal - discount_total + tax_total + gratuity_total,2)) > 0.10
+                                AND ABS(ROUND(total,2) - ROUND(subtotal + tax_total + gratuity_total,2)) > 0.10
+                                AND ABS(ROUND(total,2) - ROUND(subtotal + tax_total + discount_total + gratuity_total,2)) > 0.10
+                                AND ABS(
+                                    ROUND(total,2) -
+                                    ROUND(
+                                        subtotal
+                                        + tax_total
+                                        + discount_total
+                                        - (discount_total * SAFE_DIVIDE(tax_total, NULLIF(subtotal,0))),
+                                        2
+                                    )
+                                    ) > 0.10
+
+                                -- Model F: fee-based residuals (ACCEPT if true, so FAIL only if NOT true)
+                                AND NOT (
+                                ROUND(total - (subtotal + tax_total + gratuity_total), 2)
+                                    BETWEEN 0.01 AND 50.00
+                                )
+                            ),
+
+
+                            /* ---------------------------------------------------------------
+                            7) Completeness vs RAW (windowing optional; compares IDs)
+                            ---------------------------------------------------------------- */
+                            raw_missing_in_orders AS (
+                            SELECT r.order_id
+                            FROM orders_raw r
+                            LEFT JOIN orders o USING (order_id)
+                            WHERE o.order_id IS NULL
+                            ),
+                            orders_not_in_raw AS (
+                            SELECT o.order_id
+                            FROM orders o
+                            LEFT JOIN orders_raw r USING (order_id)
+                            WHERE r.order_id IS NULL
+                            ),
+
+                            /* ---------------------------------------------------------------
+                            8) Referential integrity with line_items and primary_contact
+                            ---------------------------------------------------------------- */
+                            orders_zero_line_items_summary AS (
+                            SELECT
+                                COUNT(*) AS orders_with_zero_line_items
+                            FROM orders o
+                            LEFT JOIN line_items li USING (order_id)
+                            WHERE li.order_id IS NULL
+                            ),
+                            orders_missing_primary_contact_summary AS (
+                            SELECT
+                                COUNT(*) AS orders_missing_primary_contact
+                            FROM orders o
+                            LEFT JOIN primary_contact pc USING (order_id)
+                            WHERE pc.order_id IS NULL
+                            ),
+                            orders_multi_primary_contact_summary AS (
+                            SELECT
+                                COUNT(*) AS orders_with_multiple_primary_contacts
+                            FROM (
+                                SELECT pc.order_id
+                                FROM `rocket_rez_data.primary_contact` pc
+                                GROUP BY pc.order_id
+                                HAVING COUNT(*) > 1
+                            )
+                            ),
+
+                            /* ---------------------------------------------------------------
+                            9) Descriptive rollups (quick anomaly checks)
+                            ---------------------------------------------------------------- */
+                            financial_rollup AS (
+                            SELECT
+                                COUNT(*) AS n_orders,
+                                SUM(COALESCE(total,0))          AS sum_total,
+                                SUM(COALESCE(subtotal,0))       AS sum_subtotal,
+                                SUM(COALESCE(tax_total,0))      AS sum_tax_total,
+                                SUM(COALESCE(gratuity_total,0)) AS sum_gratuity_total,
+                                SUM(COALESCE(discount_total,0)) AS sum_discount_total
+                            FROM orders
+                            ),
+                            web_vs_pos AS (
+                            SELECT
+                                web_order,
+                                COUNT(*) AS n,
+                                SUM(COALESCE(total,0)) AS total_amount
+                            FROM orders
+                            GROUP BY web_order
+                            ),
+                            status_counts AS (
+                            SELECT
+                                UPPER(TRIM(REGEXP_REPLACE(status, r'\p{Zs}+', ' '))) AS status_norm,
+                                COUNT(*) AS n,
+                                SUM(COALESCE(total,0)) AS total_amount
+                            FROM orders
+                            GROUP BY status_norm
+                            )
+
+                            -- ===============================================================
+                            -- UNIFIED OUTPUT (two columns for every test)
+                            -- ===============================================================
+
+                            SELECT
+                            'INFO' AS severity,
+                            '1. NULL OVERVIEW (informational)' AS test_name,
+                            TO_JSON_STRING(t) AS result_json
+                            FROM null_overview t
+
+                            UNION ALL
+                            SELECT 
+                            'INFO' AS severity,
+                            '2. DUPLICATE order_id (should be 0)', TO_JSON_STRING(t)
+                            FROM dup_order_id t
+
+                            UNION ALL
+                            SELECT 
+                            'INFO' AS severity,
+                            '3. BAD TIMESTAMP ORDER (created_date > modified_date) (should be 0)', TO_JSON_STRING(t)
+                            FROM bad_timestamp_order t
+
+                            UNION ALL
+                            SELECT 
+                            'INFO' AS severity,
+                            '4. BAD CURRENCY FORMAT (should be 0)', TO_JSON_STRING(t)
+                            FROM bad_currency_format t
+
+                            UNION ALL
+                            SELECT 
+                            'INFO' AS severity,
+                            '5. BAD STATUS (outside allow-list: Option A) (should be 0)', TO_JSON_STRING(t)
+                            FROM bad_status t
+
+                            UNION ALL
+                            SELECT
+                            'ERROR' AS severity,
+                            '6. FINANCIAL MISMATCH (explicit-tax models A/B/D/E all failed)',
+                            TO_JSON_STRING(t)
+                            FROM financial_mismatch t
+
+                            UNION ALL
+                            SELECT 
+                            'INFO' AS severity,
+                            '7. COMPLETENESS: RAW order missing in orders table (should be 0)', TO_JSON_STRING(t)
+                            FROM raw_missing_in_orders t
+
+                            UNION ALL
+                            SELECT 
+                            'INFO' AS severity,
+                            '8A. REF: Orders with ZERO line items (should be 0)', TO_JSON_STRING(t)
+                            FROM orders_zero_line_items_summary t
+
+                            UNION ALL
+                            SELECT 
+                            'INFO' AS severity,
+                            '8B. REF: Orders missing primary contact (should be 0)', TO_JSON_STRING(t)
+                            FROM orders_missing_primary_contact_summary t
+
+                            UNION ALL
+                            SELECT 
+                            'INFO' AS severity,
+                            '8C. REF: Orders with >1 primary contact (should be 0)', TO_JSON_STRING(t)
+                            FROM orders_multi_primary_contact_summary t
+
+                            UNION ALL
+                            SELECT 
+                            'INFO' AS severity,
+                            '9A. ROLLUP: financial totals (informational)', TO_JSON_STRING(t)
+                            FROM financial_rollup t
+
+                            UNION ALL
+                            SELECT 
+                            'INFO' AS severity,
+                            '9B. ROLLUP: web vs non-web mix (informational)', TO_JSON_STRING(t)
+                            FROM web_vs_pos t
+
+                            UNION ALL
+                            SELECT 
+                            'INFO' AS severity,
+                            '9C. ROLLUP: status counts (informational)', TO_JSON_STRING(t)
+                            FROM status_counts t);
+
+                            INSERT INTO `rocket_rez_data.audit_log`
+                            (
+                                audit_timestamp,
+                                table_name,
+                                severity,
+                                test_name,
+                                result_json
+                            )
+                            SELECT
+                                CURRENT_TIMESTAMP(),
+                                'orders',
+                                severity,
+                                test_name,
+                                result_json
+                            FROM validation_results;
+
+                            ASSERT (
+                                SELECT COUNT(*)
+                                FROM validation_results
+                                WHERE severity = 'ERROR'
+                            ) = 0
+                            AS 'Orders validation failed.';
+                        useLegacySql: false
+
+    # ------------------------------------------------------------
+    # 7) VALIDATE: LINE_ITEMS
+    # ------------------------------------------------------------
+    - validate_line_items:
+        call: googleapis.bigquery.v2.jobs.insert
+        args:
+            projectId: ${project_id}
+            body:
+                configuration:
+                    query:
+                        query: |
+                            CREATE TEMP TABLE validation_results AS(
+
+                            WITH
+                            -- ---------------------------------------------------------------
+                            -- 0) RAW flatten: build the source at the intended grain
+                            -- ---------------------------------------------------------------
+                            raw_flat AS (
+                            SELECT DISTINCT
+                                r.id                                        AS order_id,
+                                li.id                                       AS line_item_id,
+                                ra.rateType                                 AS rate_type,
+                                li.type                                     AS line_item_type,
+                                li.typeId                                   AS line_item_type_id,
+                                li.name                                     AS line_item_name,
+                                CAST(li.productId AS STRING)                AS product_id,
+                                CAST(ra.price AS NUMERIC)                   AS line_item_price,
+                                CAST(ra.taxTotal AS NUMERIC)                AS line_item_tax_total,
+                                CAST(ra.subTotal AS NUMERIC)                AS line_item_subtotal,
+                                ARRAY_TO_STRING(ra.serials, ',')            AS serials,
+                                ra.quantity                                 AS line_item_quantity,
+                                CAST(ra.couponAmount AS NUMERIC)            AS coupon_amount,
+                                CAST(ra.priceOverrideAmount AS NUMERIC)     AS price_override_amount
+                            FROM `rocket_rez_data.raw_data` AS r
+                            LEFT JOIN UNNEST(IFNULL(r.lineItems, [])) AS li ON TRUE
+                            LEFT JOIN UNNEST(IFNULL(li.rateTypes, [])) AS ra ON TRUE
+                            ),
+
+                            -- ---------------------------------------------------------------
+                            -- 1) Composite, NULL-safe keys for RAW and TABLE
+                            --    (avoid NULL ≠ NULL join problems by normalizing to strings)
+                            -- ---------------------------------------------------------------
+                            raw_keys AS (
+                            SELECT DISTINCT
+                                order_id, line_item_id, rate_type,
+                                CONCAT(
+                                'O:', IFNULL(CAST(order_id AS STRING), 'NULL'), '|',
+                                'LI:', IFNULL(CAST(line_item_id AS STRING), 'NULL'), '|',
+                                'RT:', IFNULL(rate_type, 'NULL')
+                                ) AS li_key
+                            FROM raw_flat
+                            -- Optional: if you want to ignore rows with fully NULL key
+                            -- WHERE NOT (order_id IS NULL AND line_item_id IS NULL AND rate_type IS NULL)
+                            ),
+
+                            tbl AS (
+                            SELECT * FROM `rocket_rez_data.line_items`
+                            ),
+
+                            tbl_keys AS (
+                            SELECT DISTINCT
+                                order_id, line_item_id, rate_type,
+                                CONCAT(
+                                'O:', IFNULL(CAST(order_id AS STRING), 'NULL'), '|',
+                                'LI:', IFNULL(CAST(line_item_id AS STRING), 'NULL'), '|',
+                                'RT:', IFNULL(rate_type, 'NULL')
+                                ) AS li_key
+                            FROM tbl
+                            ),
+
+                            -- ---------------------------------------------------------------
+                            -- 2) RAW fan-out duplicates (same business key > 1 in source)
+                            -- ---------------------------------------------------------------
+                            raw_dups AS (
+                            SELECT li_key, COUNT(*) AS cnt
+                            FROM raw_keys
+                            WHERE line_item_id IS NOT NULL
+                                AND rate_type IS NOT NULL
+                            GROUP BY li_key
+                            HAVING COUNT(*) > 1
+                            ),
+
+                            -- ---------------------------------------------------------------
+                            -- 3) Table duplicates at intended grain
+                            -- ---------------------------------------------------------------
+                            tbl_dups AS (
+                            SELECT li_key, COUNT(*) AS cnt
+                            FROM tbl_keys
+                            GROUP BY li_key
+                            HAVING COUNT(*) > 1
+                            ),
+
+                            -- ---------------------------------------------------------------
+                            -- 4) Completeness: RAW → TABLE (missing in table)
+                            -- ---------------------------------------------------------------
+                            missing_in_table AS (
+                            SELECT r.order_id, r.line_item_id, r.rate_type, r.li_key
+                            FROM raw_keys r
+                            LEFT JOIN tbl_keys t USING (li_key)
+                            WHERE t.li_key IS NULL
+                                AND r.line_item_id IS NOT NULL
+                                AND r.rate_type IS NOT NULL
+                            ),
+
+                            -- ---------------------------------------------------------------
+                            -- 5) Completeness: TABLE → RAW (extras in table)
+                            -- ---------------------------------------------------------------
+
+                            extra_in_table AS (
+                            SELECT t.order_id, t.line_item_id, t.rate_type, t.li_key
+                            FROM tbl_keys t
+                            LEFT JOIN raw_keys r USING (li_key)
+                            WHERE r.li_key IS NULL
+                                AND t.line_item_id IS NOT NULL
+                                AND t.rate_type IS NOT NULL
+                            ),
+
+                            -- ---------------------------------------------------------------
+                            -- 6) Null counters for key/critical columns (overview)
+                            -- ---------------------------------------------------------------
+                            null_counts AS (
+                            SELECT
+                                COUNTIF(order_id IS NULL)            AS null_order_id,
+                                COUNTIF(line_item_id IS NULL)        AS null_line_item_id,
+                                COUNTIF(rate_type IS NULL)           AS null_rate_type,
+                                COUNTIF(line_item_price IS NULL)     AS null_price,
+                                COUNTIF(line_item_quantity IS NULL)  AS null_quantity,
+                                COUNTIF(line_item_subtotal IS NULL)  AS null_subtotal,
+                                COUNTIF(line_item_tax_total IS NULL) AS null_tax_total
+                            FROM tbl
+                            ),
+
+                            -- ---------------------------------------------------------------
+                            -- 7) Negative numbers (flag any obviously invalid negatives)
+                            --     (Adjust if your business allows negatives in specific fields)
+                            -- ---------------------------------------------------------------
+                            negatives AS (
+                            SELECT
+                                surrogate_key, order_id, line_item_id, rate_type,
+                                line_item_price, line_item_quantity, line_item_tax_total, line_item_subtotal,
+                                coupon_amount, price_override_amount
+                            FROM tbl
+                            WHERE
+                                line_item_price        < 0 OR
+                                line_item_quantity     < 0 OR
+                                line_item_tax_total    < 0 OR
+                                line_item_subtotal     < 0
+                            ),
+
+                            -- ---------------------------------------------------------------
+                            -- 8) Per-unit override pricing model
+                            -- ---------------------------------------------------------------
+                            math_mismatch AS (
+                            WITH li AS (
+                                SELECT
+                                surrogate_key,
+                                order_id,
+                                line_item_id,
+                                rate_type,
+                                COALESCE(CAST(line_item_price AS NUMERIC), 0)       AS price,
+                                COALESCE(CAST(line_item_quantity AS NUMERIC), 0)    AS qty,
+                                COALESCE(CAST(line_item_subtotal AS NUMERIC), 0)    AS subtotal,
+                                COALESCE(coupon_amount, 0)                          AS coupon,
+                                COALESCE(price_override_amount, 0)                  AS override
+                                FROM `rocket_rez_data.line_items`
+                            ),
+                            evals AS (
+                                SELECT
+                                surrogate_key, order_id, line_item_id, rate_type,
+                                price, qty, subtotal, coupon, override,
+                                ((price + override) * qty) - coupon                       AS expected,
+                                ABS(subtotal - (((price + override) * qty) - coupon))     AS abs_delta
+                                FROM li
+                            )
+                            SELECT *
+                            FROM evals
+                            WHERE abs_delta > 0.02   -- tolerance for rounding
+                            ),
+
+                            math_mismatch_summary AS (
+                            SELECT
+                                COUNT(*)                        AS line_items_affected,
+                                COUNT(DISTINCT order_id)        AS orders_affected,
+                                MAX(abs_delta)                  AS max_abs_delta
+                            FROM math_mismatch
+                            ),
+
+                            -- ---------------------------------------------------------------
+                            -- 9) Serials with duplicate tokens inside a row (comma-separated)
+                            -- ---------------------------------------------------------------
+                            serials_dup_tokens AS (
+                            SELECT
+                                surrogate_key, order_id, line_item_id, rate_type, serials
+                            FROM tbl
+                            WHERE serials IS NOT NULL
+                                AND ARRAY_LENGTH(SPLIT(serials, ',')) != ARRAY_LENGTH(
+                                    ARRAY(SELECT DISTINCT TRIM(x) FROM UNNEST(SPLIT(serials, ',')) AS x)
+                                    )
+                            ),
+
+                            -- ---------------------------------------------------------------
+                            -- 10) Surrogate key uniqueness summary
+                            -- ---------------------------------------------------------------
+                            sk_summary AS (
+                            SELECT
+                                (SELECT COUNT(*) FROM tbl)                                  AS total_rows,
+                                (SELECT COUNT(DISTINCT surrogate_key) FROM tbl)             AS distinct_surrogate_keys
+                            )
+
+                            -- ===============================================================
+                            -- UNIFIED OUTPUT (two columns for every test)
+                            -- ===============================================================
+                            SELECT
+                            'ERROR' AS severity,
+                            '1. TABLE DUPLICATES at (order_id, line_item_id, rate_type) — should be 0' AS test_name,
+                            TO_JSON_STRING(t) AS result_json
+                            FROM tbl_dups t
+
+                            UNION ALL
+                            SELECT
+                            'ERROR' AS severity,
+                            '2. RAW → TABLE MISSING keys — should be 0',
+                            TO_JSON_STRING(t)
+                            FROM missing_in_table t
+
+                            UNION ALL
+                            SELECT
+                            'INFO' AS severity,
+                            '3. SURROGATE KEY UNIQUENESS summary', -- both counts should be equal in order for this test to be valid 
+                            TO_JSON_STRING(t)
+                            FROM sk_summary t
+
+                            UNION ALL
+                            SELECT
+                            'INFO' AS severity,
+                            '4. NULL COUNTS for key/critical columns (investigate non-zeros)', -- only need to be concerned if order_id returns anthing other than 0
+                            TO_JSON_STRING(t)
+                            FROM null_counts t
+
+                            UNION ALL
+                            SELECT
+                            'ERROR' AS severity,
+                            '5. NEGATIVE VALUES detected (should be 0 rows unless allowed)',
+                            TO_JSON_STRING(t)
+                            FROM negatives t
+
+                            UNION ALL
+                            SELECT
+                            'INFO' AS severity,
+                            '6. SOFT MATH MISMATCH (summary; rounding tolerance)',
+                            TO_JSON_STRING(t)
+                            FROM math_mismatch_summary t
+
+                            UNION ALL
+                            SELECT
+                            'ERROR' AS severity,
+                            '7. SERIALS have duplicate tokens within the same row',
+                            TO_JSON_STRING(t)
+                            FROM serials_dup_tokens t
+
+                            UNION ALL
+                            SELECT
+                            'ERROR' AS severity,
+                            '8. RAW FAN-OUT duplicates (same business key > 1 in RAW)',
+                            TO_JSON_STRING(t)
+                            FROM raw_dups t);
+
+                            INSERT INTO `rocket_rez_data.audit_log`
+                            (
+                                audit_timestamp,
+                                table_name,
+                                severity,
+                                test_name,
+                                result_json
+                            )
+                            SELECT
+                                CURRENT_TIMESTAMP(),
+                                'line_items',
+                                severity,
+                                test_name,
+                                result_json
+                            FROM validation_results;
+
+                            ASSERT (
+                                SELECT COUNT(*)
+                                FROM validation_results
+                                WHERE severity = 'ERROR'
+                            ) = 0
+                            AS 'Line Items validation failed.';
+                        useLegacySql: false
+
+    # ------------------------------------------------------------
+    # 8) VALIDATE: PRIMARY_CONTACT
+    # ------------------------------------------------------------
+    - validate_primary_contact:
+        call: googleapis.bigquery.v2.jobs.insert
+        args:
+            projectId: ${project_id}
+            body:
+                configuration:
+                    query:
+                        query: |
+                            CREATE TEMP TABLE validation_results AS(
+
+                            WITH
+                            /* ---------------------------------------------------------------
+                            0) TABLE references
+                            ---------------------------------------------------------------- */
+                            contacts AS (
+                            SELECT * FROM `rocket_rez_data.primary_contact`
+                            ),
+                            orders_raw AS (  -- orders present in raw (each should have one contact row after load)
+                            SELECT DISTINCT r.id AS order_id
+                            FROM `rocket_rez_data.raw_data` r
+                            ),
+
+                            /* ---------------------------------------------------------------
+                            1) Derived "unknown" flag from fields (no dependency on stored column)
+                                Unknown if ALL identity fields are empty/placeholder:
+                                email, first_name, last_name, phone
+                            ---------------------------------------------------------------- */
+                            contacts_aug AS (
+                            SELECT
+                                c.*,
+                                -- normalized versions (defensive)
+                                NULLIF(LOWER(TRIM(email)), 'no email') AS email_norm,
+                                NULLIF(REGEXP_REPLACE(LOWER(TRIM(phone)), r'[^0-9x]', ''), '') AS phone_norm,
+                                TRIM(first_name) AS first_name_norm,
+                                TRIM(last_name)  AS last_name_norm,
+                                -- derived unknown-contact flag
+                                CASE
+                                WHEN (email IS NULL OR LOWER(TRIM(email)) = 'no email' OR TRIM(email) = '')
+                                AND (first_name IS NULL OR TRIM(first_name) = '')
+                                AND (last_name  IS NULL OR TRIM(last_name)  = '')
+                                AND (phone IS NULL OR REGEXP_REPLACE(LOWER(TRIM(phone)), r'[^0-9x]', '') = '')
+                                THEN TRUE ELSE FALSE
+                                END AS is_unknown_derived
+                            FROM contacts c
+                            ),
+
+                            /* ---------------------------------------------------------------
+                            2) If you added a stored is_unknown_contact, validate consistency
+                            ---------------------------------------------------------------- */
+                            unknown_mismatch AS (
+                            SELECT
+                                order_id, contact_surrogate_key, is_unknown_derived,
+                                /* If column doesn't exist, this expression will error.
+                                To run safely regardless of column presence, comment the next line
+                                and the "Test 5A" UNION at the bottom. */
+                                SAFE_CAST(NULLIF(CAST(c.is_unknown_contact AS STRING), '') AS BOOL) AS is_unknown_stored
+                            FROM contacts_aug c
+                            WHERE TRUE
+                            ),
+                            unknown_mismatch_rows AS (
+                            SELECT *
+                            FROM unknown_mismatch
+                            WHERE is_unknown_stored IS NOT NULL
+                                AND is_unknown_stored IS DISTINCT FROM is_unknown_derived
+                            ),
+
+                            /* ---------------------------------------------------------------
+                            3) Not-null overview (table-level)
+                            ---------------------------------------------------------------- */
+                            null_overview AS (
+                            SELECT
+                                COUNT(*) AS total_rows,
+                                COUNTIF(contact_surrogate_key IS NULL) AS null_contact_surrogate_key,
+                                COUNTIF(order_id IS NULL)              AS null_order_id,
+                                COUNTIF(email IS NULL OR LOWER(TRIM(email)) = 'no email' OR TRIM(email) = '') AS empty_email,
+                                COUNTIF(first_name IS NULL OR TRIM(first_name) = '')                           AS empty_first_name,
+                                COUNTIF(last_name  IS NULL OR TRIM(last_name)  = '')                           AS empty_last_name,
+                                COUNTIF(phone IS NULL OR REGEXP_REPLACE(LOWER(TRIM(phone)), r'[^0-9x]', '') = '') AS empty_phone
+                            FROM contacts
+                            ),
+
+                            /* ---------------------------------------------------------------
+                            4) Duplicates by ORDER grain (should be 0)  ← new rule
+                            ---------------------------------------------------------------- */
+                            dups_by_order AS (
+                            SELECT order_id, COUNT(*) AS cnt
+                            FROM contacts
+                            WHERE order_id IS NOT NULL
+                            GROUP BY order_id
+                            HAVING COUNT(*) > 1
+                            ),
+
+                            /* ---------------------------------------------------------------
+                            5) Surrogate key uniqueness
+                            ---------------------------------------------------------------- */
+                            sk_uniqueness AS (
+                            SELECT
+                                (SELECT COUNT(*) FROM contacts) AS total_rows,
+                                (SELECT COUNT(DISTINCT contact_surrogate_key) FROM contacts) AS distinct_surrogate_keys
+                            ),
+
+                            /* ---------------------------------------------------------------
+                            6) Unknown contact summary (allowed; we just report rate)
+                            ---------------------------------------------------------------- */
+                            unknown_summary AS (
+                            SELECT
+                                COUNT(*) AS total_rows,
+                                COUNTIF(is_unknown_derived) AS unknown_rows,
+                                SAFE_DIVIDE(COUNTIF(is_unknown_derived), COUNT(*)) AS unknown_rate
+                            FROM contacts_aug
+                            ),
+
+                            /* ---------------------------------------------------------------
+                            7) Basic format checks (post-load)
+                                These are informational now that you normalize on load.
+                            ---------------------------------------------------------------- */
+                            bad_email_format AS (
+                            SELECT primary_contact_id, order_id, email
+                            FROM contacts
+                            WHERE email IS NOT NULL
+                                AND NOT REGEXP_CONTAINS(LOWER(TRIM(email)),
+                                r'^[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}$')
+                            ),
+                            bad_email_format_summary AS (
+                            SELECT
+                                COUNT(*) AS bad_email_rows,
+                                COUNT(DISTINCT order_id) AS affected_orders,
+                                SAFE_DIVIDE(
+                                COUNT(*),
+                                (SELECT COUNT(*) FROM contacts)
+                                ) AS bad_email_rate
+                            FROM bad_email_format
+                            ),
+                            leading_trailing_email AS (
+                            SELECT primary_contact_id, order_id, email
+                            FROM contacts
+                            WHERE email IS NOT NULL
+                                AND (email != TRIM(email) OR email != LOWER(email))  -- indicates casing/whitespace still present
+                            ),
+
+                            /* ---------------------------------------------------------------
+                            8) Completeness vs RAW orders (each raw order should have a row)
+                            ---------------------------------------------------------------- */
+                            orders_missing_contact AS (
+                            SELECT o.order_id
+                            FROM orders_raw o
+                            LEFT JOIN contacts c USING (order_id)
+                            WHERE c.order_id IS NULL
+                            ),
+
+                            /* ---------------------------------------------------------------
+                            9) primary_contact_id duplicates — informational under new rule
+                            ---------------------------------------------------------------- */
+                            dup_primary_contact_id_summary AS (
+                            SELECT
+                                COUNT(*) AS distinct_primary_contact_ids_with_dups,
+                                SUM(cnt) AS total_rows_involved,
+                                MAX(cnt) AS max_dup_count
+                            FROM (
+                                SELECT primary_contact_id, COUNT(*) AS cnt
+                                FROM contacts
+                                WHERE primary_contact_id IS NOT NULL
+                                GROUP BY primary_contact_id
+                                HAVING COUNT(*) > 1
+                            )
+                            )
+                            ,
+
+                            /* ---------------------------------------------------------------
+                            10) Email duplicates — informational (shared inboxes expected)
+                            ---------------------------------------------------------------- */
+                            dup_email_summary AS (
+                            SELECT
+                                COUNT(*) AS distinct_emails_with_dups,
+                                SUM(cnt) AS total_rows_involved,
+                                MAX(cnt) AS max_dup_count
+                            FROM (
+                                SELECT LOWER(TRIM(email)) AS email_lc, COUNT(*) AS cnt
+                                FROM contacts
+                                WHERE email IS NOT NULL
+                                AND TRIM(email) != ''
+                                AND LOWER(TRIM(email)) <> 'no email'
+                                GROUP BY LOWER(TRIM(email))
+                                HAVING COUNT(*) > 1
+                            )
+                            )
+
+                            -- ===============================================================
+                            -- UNIFIED OUTPUT (every test -> 2 columns)
+                            -- ===============================================================
+                            SELECT 
+                            'INFO' AS severity,
+                            '1. NULL OVERVIEW (informational)' AS test_name, TO_JSON_STRING(t) AS result_json -- null/empty values are allowed (except: contact_surrogate_key, and order_id)
+                            FROM null_overview t
+
+                            UNION ALL 
+                            SELECT
+                            'ERROR' AS severity,
+                            '2. DUPLICATE rows per ORDER (should be 0)', TO_JSON_STRING(t) -- needs to be zero/not return in order to pass the validation 
+                            FROM dups_by_order t
+
+                            UNION ALL
+                            SELECT 
+                            'INFO' AS severity,
+                            '3. SURROGATE KEY UNIQUENESS summary', TO_JSON_STRING(t)
+                            FROM sk_uniqueness t
+
+                            UNION ALL
+                            SELECT 
+                            'WARN' AS severity,
+                            '4. UNKNOWN CONTACT SUMMARY (allowed)', TO_JSON_STRING(t) -- unknowns expected and allowed as they represent purchases at the door 
+                            FROM unknown_summary t
+
+                            UNION ALL
+                            -- If you didn't add is_unknown_contact column yet, comment out this block:
+                            SELECT 
+                            'WARN' AS severity,
+                            '5A. is_unknown_contact (stored) ≠ derived (should be 0 if column exists)', TO_JSON_STRING(t)
+                            FROM unknown_mismatch_rows t
+
+                            UNION ALL
+                            SELECT
+                            'WARN' AS severity,
+                            '6A. BAD EMAIL FORMAT (summary)',
+                            TO_JSON_STRING(t)
+                            FROM bad_email_format_summary t
+
+                            UNION ALL
+                            SELECT 
+                            'WARN' AS severity,
+                            '6B. EMAIL still has casing/whitespace (should be 0 if normalized on load)', TO_JSON_STRING(t)
+                            FROM leading_trailing_email t
+
+                            UNION ALL
+                            SELECT 
+                            'WARN' AS severity,
+                            '7. COMPLETENESS: RAW orders missing a contact row (should be 0)', TO_JSON_STRING(t)
+                            FROM orders_missing_contact t
+
+                            UNION ALL
+                            SELECT
+                            'INFO' AS severity,
+                            '8A. INFO: Duplicate primary_contact_id (summary)' AS test_name,
+                            TO_JSON_STRING(t) AS result_json
+                            FROM dup_primary_contact_id_summary t
+
+                            UNION ALL
+                            SELECT
+                            'INFO' AS severity,
+                            '8B. INFO: Duplicate email (summary)',
+                            TO_JSON_STRING(t)
+                            FROM dup_email_summary t);
+
+                            INSERT INTO `rocket_rez_data.audit_log`
+                            (
+                                audit_timestamp,
+                                table_name,
+                                severity,
+                                test_name,
+                                result_json
+                            )
+                            SELECT
+                                CURRENT_TIMESTAMP(),
+                                'primary_contact',
+                                severity,
+                                test_name,
+                                result_json
+                            FROM validation_results;
+
+                            ASSERT (
+                                SELECT COUNT(*)
+                                FROM validation_results
+                                WHERE severity = 'ERROR'
+                            ) = 0
+                            AS 'Primary Contact validation failed.';
+                        useLegacySql: false
+
+    # ------------------------------------------------------------
+    # 9) VALIDATE: EVENT
+    # ------------------------------------------------------------
+    - validate_event:
+        call: googleapis.bigquery.v2.jobs.insert
+        args:
+            projectId: ${project_id}
+            body:
+                configuration:
+                    query:
+                        query: |
+                            CREATE TEMP TABLE validation_results AS(
+
+                            WITH
+                            -- ===============================================================
+                            -- 0. COMMON CTEs
+                            -- ===============================================================
+                            raw_events AS (
+                            SELECT DISTINCT
+                                li.event.schedule.id                           AS schedule_id,
+                                CAST(li.event.schedule.date AS DATE)           AS event_date,
+                                CAST(li.event.schedule.startTime AS TIMESTAMP) AS event_start,
+                                CAST(li.event.schedule.endTime   AS TIMESTAMP) AS event_end,
+                                li.event.id                                    AS raw_event_id
+                            FROM `rocket_rez_data.raw_data` r
+                            LEFT JOIN UNNEST(IFNULL(r.lineItems, [])) li
+                            WHERE NOT (
+                                li.event.schedule.id        IS NULL
+                                AND li.event.schedule.date      IS NULL
+                                AND li.event.schedule.startTime IS NULL
+                                AND li.event.schedule.endTime   IS NULL
+                            )
+                            ),
+
+                            event_table AS (
+                            SELECT * FROM `rocket_rez_data.event`
+                            ),
+
+                            -- RAW tuples at canonical grain (event_end NOT part of identity)
+                            sched_tuple_raw AS (
+                            SELECT DISTINCT
+                                schedule_id,
+                                event_date,
+                                event_start
+                            FROM raw_events
+                            ),
+
+                            sched_tuple_event AS (
+                            SELECT DISTINCT
+                                schedule_id,
+                                event_date,
+                                event_start
+                            FROM event_table
+                            ),
+
+                            -- RAW event_ids reused across multiple schedules (guard test)
+                            event_ids_reused AS (
+                            SELECT raw_event_id AS event_id
+                            FROM raw_events
+                            WHERE raw_event_id IS NOT NULL
+                            GROUP BY raw_event_id
+                            HAVING COUNT(
+                                DISTINCT CONCAT(
+                                IFNULL(CAST(schedule_id AS STRING),'NULL'), '|',
+                                IFNULL(CAST(event_date  AS STRING),'NULL'), '|',
+                                IFNULL(CAST(event_start AS STRING),'NULL')
+                                )
+                            ) > 1
+                            ),
+
+                            -- Canonical RAW event per schedule = MAX(event_end)
+                            canonical_raw AS (
+                            SELECT
+                                schedule_id,
+                                event_date,
+                                event_start,
+                                event_end,
+                                raw_event_id
+                            FROM (
+                                SELECT
+                                schedule_id,
+                                event_date,
+                                event_start,
+                                event_end,
+                                raw_event_id,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY schedule_id, event_date, event_start
+                                    ORDER BY event_end DESC
+                                ) AS rn
+                                FROM raw_events
+                            )
+                            WHERE rn = 1
+                            )
+
+                            -- ===============================================================
+                            -- ALL TESTS BELOW HAVE SAME OUTPUT SHAPE
+                            -- ===============================================================
+
+                            -- ---------------------------------------------------------------
+                            -- 1. Duplicate events at canonical grain
+                            -- ---------------------------------------------------------------
+                            SELECT
+                            'Error' AS severity,
+                            '1. DUPLICATE EVENTS (should be 0)' AS test_name,
+                            TO_JSON_STRING(t) AS result_json
+                            FROM (
+                            SELECT
+                                schedule_id,
+                                event_date,
+                                event_start,
+                                COUNT(*) AS cnt
+                            FROM event_table
+                            GROUP BY 1,2,3
+                            HAVING COUNT(*) > 1
+                            ) t
+
+
+                            UNION ALL
+
+                            -- ---------------------------------------------------------------
+                            -- 2. RAW → EVENT completeness (canonical grain)
+                            -- ---------------------------------------------------------------
+                            SELECT
+                            'Error' AS severity,
+                            '2. RAW → EVENT MISSING (should be 0)',
+                            TO_JSON_STRING(t)
+                            FROM (
+                            SELECT r.*
+                            FROM sched_tuple_raw r
+                            LEFT JOIN sched_tuple_event e
+                                USING (schedule_id, event_date, event_start)
+                            WHERE e.schedule_id IS NULL
+                            ) t
+
+
+                            UNION ALL
+
+                            -- ---------------------------------------------------------------
+                            -- 4. Attribute inconsistencies (end-time allowed to vary)
+                            -- ---------------------------------------------------------------
+                            SELECT
+                            'Error' AS severity,
+                            '4. ATTRIBUTE INCONSISTENCIES (should be 0)',
+                            TO_JSON_STRING(t)
+                            FROM (
+                            SELECT
+                                schedule_id,
+                                COUNT(DISTINCT event_name)  AS names,
+                                COUNT(DISTINCT event_type)  AS types,
+                                COUNT(DISTINCT event_date)  AS dates,
+                                COUNT(DISTINCT event_start) AS starts
+                            FROM event_table
+                            GROUP BY schedule_id, event_date, event_start
+                            HAVING
+                                names  > 1 OR
+                                types  > 1 OR
+                                dates  > 1 OR
+                                starts > 1
+                            ) t
+
+                            UNION ALL
+
+                            -- ---------------------------------------------------------------
+                            -- 5. Surrogate key uniqueness summary
+                            -- ---------------------------------------------------------------
+                            SELECT
+                            'INFO' AS severity,
+                            '5. SURROGATE KEY UNIQUENESS',
+                            TO_JSON_STRING(t)
+                            FROM (
+                            SELECT
+                                (SELECT COUNT(*) FROM event_table)                      AS total_rows,
+                                (SELECT COUNT(DISTINCT event_surrogate_key)
+                                FROM event_table)                                     AS distinct_keys
+                            ) t
+
+                            UNION ALL
+
+                            -- ---------------------------------------------------------------
+                            -- 6. Null identity rows
+                            -- ---------------------------------------------------------------
+                            SELECT
+                            'Error' AS severity,
+                            '6. NULL-IDENTITY ROWS (should be 0)',
+                            TO_JSON_STRING(t)
+                            FROM (
+                            SELECT *
+                            FROM event_table
+                            WHERE schedule_id IS NULL
+                                AND event_date  IS NULL
+                                AND event_start IS NULL
+                            ) t
+
+                            UNION ALL
+
+                            -- ---------------------------------------------------------------
+                            -- 7. Guard: reused event_ids must not merge schedules
+                            -- ---------------------------------------------------------------
+                            SELECT
+                            'WARN' AS severity,
+                            '7. OPTION A GUARD — reused event_ids must not merge schedules',
+                            TO_JSON_STRING(t)
+                            FROM (
+                            SELECT
+                                e.event_id,
+                                COUNT(
+                                DISTINCT CONCAT(
+                                    IFNULL(CAST(e.schedule_id AS STRING),'NULL'), '|',
+                                    IFNULL(CAST(e.event_date  AS STRING),'NULL'), '|',
+                                    IFNULL(CAST(e.event_start AS STRING),'NULL')
+                                )
+                                ) AS distinct_schedules_in_event_table
+                            FROM event_table e
+                            WHERE e.event_id IN (SELECT event_id FROM event_ids_reused)
+                            GROUP BY e.event_id
+                            HAVING COUNT(
+                                DISTINCT CONCAT(
+                                IFNULL(CAST(e.schedule_id AS STRING),'NULL'), '|',
+                                IFNULL(CAST(e.event_date  AS STRING),'NULL'), '|',
+                                IFNULL(CAST(e.event_start AS STRING),'NULL')
+                                )
+                            ) = 1   -- WRONG: reused ID collapsed multiple schedules!
+                            ) t);
+
+                            INSERT INTO `rocket_rez_data.audit_log`
+                            (
+                                audit_timestamp,
+                                table_name,
+                                severity,
+                                test_name,
+                                result_json
+                            )
+                            SELECT
+                                CURRENT_TIMESTAMP(),
+                                'event',
+                                severity,
+                                test_name,
+                                result_json
+                            FROM validation_results;
+
+                            ASSERT (
+                                SELECT COUNT(*)
+                                FROM validation_results
+                                WHERE severity = 'ERROR'
+                            ) = 0
+                            AS 'Event validation failed.';
+                        useLegacySql: false
+    # ------------------------------------------------------------
+    # 10) SUCCESS
+    # ------------------------------------------------------------
+    - done:
+        return: "Pipeline completed successfully"
