@@ -183,6 +183,18 @@ Whenever possible, AI reporting views mirror Power BI reporting metrics to ensur
 
 ---
 
+# archival/
+
+## Purpose
+
+Contains SQL used to preserve historical reporting states.
+
+The quarterly dashboard snapshot script materializes all approved Power BI reporting views into permanent BigQuery tables at the end of each calendar quarter.
+
+This allows historical dashboard results to remain reproducible even after live views or underlying source data change.
+
+---
+
 # SQL Development Standards
 
 The following conventions are used throughout the repository.

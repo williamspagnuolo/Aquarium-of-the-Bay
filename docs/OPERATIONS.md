@@ -449,3 +449,25 @@ The platform was designed around several operational principles.
 - Document every critical engineering decision.
 
 These principles allow the platform to be maintained by future engineers while providing reliable reporting for Aquarium operations.
+
+---
+
+# Quarterly Dashboard Snapshot
+
+A quarterly dashboard snapshot is maintained to preserve historical KPI values exactly as they appeared at the close of each reporting quarter. Unlike the live reporting views, these snapshots are not affected by subsequent data corrections or late-arriving transactions and provide a consistent reference for executive reporting and year-over-year comparisons.
+
+## Purpose
+
+- Preserve quarter-end reporting metrics.
+- Support historical executive reporting.
+- Enable consistent year-over-year comparisons.
+- Prevent historical dashboards from changing after a quarter has closed.
+
+## Refresh Procedure
+
+1. Review and validate all quarterly reporting data.
+2. Execute the `sql/reporting_views/quarterly_dashboard_snapshot.sql` script.
+3. Verify that the snapshot table contains the newly completed quarter.
+4. Refresh downstream Power BI datasets if required.
+5. Validate dashboard totals against the snapshot table to ensure the snapshot matches the live reporting views before quarter-end reporting is finalized.
+
